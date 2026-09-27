@@ -1,4 +1,4 @@
-name: Build Moulberry imgui-java ARM64
+name: Build imgui-java Linux ARM64
 
 on:
   workflow_dispatch:
@@ -9,71 +9,75 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-      # ------------------------------------------------------------
+
+      # ============================================================
       # 1. Clone repository
-      # ------------------------------------------------------------
+      # ============================================================
+
       - name: Clone Moulberry imgui-java
         shell: bash
         run: |
           set -eux
 
-          git clone --recurse-submodules \
+          git clone \
             https://github.com/Moulberry/imgui-java.git \
             imgui-java
 
           cd imgui-java
 
-          # Получаем все refs/objects, чтобы короткий SHA можно было найти.
           git fetch --all --tags --prune
 
-          # Ищем commit по короткому SHA.
           TARGET="aacdae671a"
 
-          FULL_SHA="$(git rev-list --all | grep "^${TARGET}" | head -n 1 || true)"
+          echo "Searching for commit $TARGET ..."
+
+          FULL_SHA=$(git rev-list --all | grep "^${TARGET}" | head -n 1 || true)
 
           if [ -z "$FULL_SHA" ]; then
-            echo "::error::Commit ${TARGET} не найден в Moulberry/imgui-java"
-            echo "Последние commits:"
-            git log --oneline --all -20
+            echo "::error::Commit $TARGET was not found."
+            echo "Available commits:"
+            git log --all --oneline -30
             exit 1
           fi
 
-          echo "Found commit:"
+          echo "Found:"
           echo "$FULL_SHA"
 
           git checkout "$FULL_SHA"
 
-          # После checkout обязательно обновляем submodules.
           git submodule sync --recursive
           git submodule update --init --recursive
 
-          echo "Actual HEAD:"
+          echo "======================================"
+          echo "SOURCE COMMIT"
+          echo "======================================"
+
           git rev-parse HEAD
 
-          echo "Submodules:"
+          echo "======================================"
+          echo "SUBMODULES"
+          echo "======================================"
+
           git submodule status
 
 
-      # ------------------------------------------------------------
-      # 2. Java 17
-      # ------------------------------------------------------------
-      - name: Set up Java 17
+      # ============================================================
+      # 2. Java
+      # ============================================================
+
+      - name: Setup Java 17
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
-          cache: gradle
 
 
-      # ------------------------------------------------------------
-      # 3. ARM64 cross compiler
-      # ------------------------------------------------------------
+      # ============================================================
+      # 3. ARM64 compiler
+      # ============================================================
+
       - name: Install ARM64 toolchain
-        shell: bash
         run: |
-          set -eux
-
-          sudo dpkg --add-architecture arm64
           sudo apt-get update
 
           sudo apt-get install -y \
@@ -85,182 +89,268 @@ jobs:
             libc6-dev-arm64-cross
 
 
-      # ------------------------------------------------------------
-      # 4. Check toolchain
-      # ------------------------------------------------------------
-      - name: Check ARM64 compiler
-        shell: bash
-        run: |
-          set -eux
+      # ============================================================
+      # 4. Verify compiler
+      # ============================================================
 
-          java -version
+      - name: Verify ARM64 compiler
+        run: |
+          echo "======================================"
+          echo "GCC"
+          echo "======================================"
 
           aarch64-linux-gnu-gcc --version
+
+          echo "======================================"
+          echo "G++"
+          echo "======================================"
+
           aarch64-linux-gnu-g++ --version
 
-          aarch64-linux-gnu-gcc \
-            -dumpmachine
+          echo "======================================"
+          echo "TARGET"
+          echo "======================================"
 
-          echo "Expected:"
-          echo "aarch64-linux-gnu"
+          aarch64-linux-gnu-gcc -dumpmachine
+
+          test \
+            "$(aarch64-linux-gnu-gcc -dumpmachine)" \
+            = "aarch64-linux-gnu"
 
 
-      # ------------------------------------------------------------
-      # 5. Build JNI
-      # ------------------------------------------------------------
-      - name: Build ARM64 native library
+      # ============================================================
+      # 5. Inspect build system
+      # ============================================================
+
+      - name: Inspect old imgui-java build
+        working-directory: imgui-java
+        run: |
+          echo "======================================"
+          echo "FILES"
+          echo "======================================"
+
+          find . -maxdepth 3 -type f \
+            \( \
+              -name "build.gradle" \
+              -o -name "*.gradle" \
+              -o -name "*.xml" \
+              -o -name "*.sh" \
+              -o -name "gradlew" \
+            \) \
+            | sort
+
+          echo "======================================"
+          echo "GRADLE VERSION"
+          echo "======================================"
+
+          ./gradlew --version
+
+
+      # ============================================================
+      # 6. Force ARM64 environment
+      # ============================================================
+
+      - name: Configure ARM64 environment
+        run: |
+          cat >> "$GITHUB_ENV" <<'EOF'
+          CC=aarch64-linux-gnu-gcc
+          CXX=aarch64-linux-gnu-g++
+          AR=aarch64-linux-gnu-ar
+          AS=aarch64-linux-gnu-as
+          LD=aarch64-linux-gnu-ld
+          RANLIB=aarch64-linux-gnu-ranlib
+          STRIP=aarch64-linux-gnu-strip
+          TARGET=aarch64-linux-gnu
+          EOF
+
+
+      # ============================================================
+      # 7. Build native JNI
+      # ============================================================
+
+      - name: Build native JNI
         working-directory: imgui-java
         shell: bash
-        env:
-          CC: aarch64-linux-gnu-gcc
-          CXX: aarch64-linux-gnu-g++
-          AR: aarch64-linux-gnu-ar
-          RANLIB: aarch64-linux-gnu-ranlib
-          STRIP: aarch64-linux-gnu-strip
         run: |
-          set -eux
+          set -o pipefail
 
           chmod +x gradlew
 
-          echo "CC=$CC"
-          echo "CXX=$CXX"
+          echo "======================================"
+          echo "BUILD ENVIRONMENT"
+          echo "======================================"
+
+          env | grep -E \
+            '^(CC|CXX|AR|AS|LD|RANLIB|STRIP|TARGET)=' \
+            | sort
+
+          echo "======================================"
+          echo "BUILD"
+          echo "======================================"
 
           ./gradlew \
             :imgui-binding:generateLibs \
             -Denvs=linux \
             -Dlocal \
             --no-daemon \
-            --stacktrace
+            --stacktrace \
+            --info \
+            2>&1 | tee ../gradle-build.log
 
 
-      # ------------------------------------------------------------
-      # 6. Find all produced .so files
-      # ------------------------------------------------------------
-      - name: Locate native libraries
-        working-directory: imgui-java
-        shell: bash
+      # ============================================================
+      # 8. ALWAYS print log if build failed
+      # ============================================================
+
+      - name: Print build log
+        if: always()
         run: |
-          set -eux
+          echo "======================================"
+          echo "GRADLE LOG"
+          echo "======================================"
 
-          echo "Searching for .so files..."
+          if [ -f gradle-build.log ]; then
+            cat gradle-build.log
+          else
+            echo "No gradle-build.log found."
+          fi
+
+
+      # ============================================================
+      # 9. Find native libraries
+      # ============================================================
+
+      - name: Find generated SO files
+        if: always()
+        working-directory: imgui-java
+        run: |
+          echo "======================================"
+          echo "ALL SO FILES"
+          echo "======================================"
 
           find . \
             -type f \
             -name "*.so" \
-            -print
+            -print \
+            | sort
 
 
-      # ------------------------------------------------------------
-      # 7. Find libimgui-java64.so
-      # ------------------------------------------------------------
+      # ============================================================
+      # 10. Find expected library
+      # ============================================================
+
       - name: Locate libimgui-java64.so
+        id: findlib
+        if: success()
         working-directory: imgui-java
         shell: bash
         run: |
-          set -eux
-
-          LIB="$(find . \
+          LIB=$(find . \
             -type f \
             -name "libimgui-java64.so" \
-            -print -quit)"
+            -print -quit)
 
           if [ -z "$LIB" ]; then
-            echo "::error::libimgui-java64.so was not produced."
-
-            echo "Available native files:"
-            find . \
-              -type f \
-              -name "*.so" \
-              -print
-
+            echo "::error::libimgui-java64.so was not generated."
             exit 1
           fi
+
+          echo "LIB=$LIB" >> "$GITHUB_OUTPUT"
 
           echo "Found:"
           echo "$LIB"
 
-          echo "$LIB" > /tmp/imgui_library_path.txt
 
+      # ============================================================
+      # 11. Check architecture
+      # ============================================================
 
-      # ------------------------------------------------------------
-      # 8. Verify ELF architecture
-      # ------------------------------------------------------------
-      - name: Verify AArch64 ELF
+      - name: Verify ARM64 ELF
+        if: success()
         working-directory: imgui-java
-        shell: bash
         run: |
-          set -eux
+          LIB="${{ steps.findlib.outputs.LIB }}"
 
-          LIB="$(cat /tmp/imgui_library_path.txt)"
-
-          echo "Checking:"
-          echo "$LIB"
+          echo "======================================"
+          echo "FILE"
+          echo "======================================"
 
           file "$LIB"
+
+          echo "======================================"
+          echo "ELF HEADER"
+          echo "======================================"
 
           readelf -h "$LIB"
 
 
-      # ------------------------------------------------------------
-      # 9. HARD architecture check
-      # ------------------------------------------------------------
-      - name: Reject non-ARM64 library
+      # ============================================================
+      # 12. HARD ARM64 validation
+      # ============================================================
+
+      - name: Reject non ARM64
+        if: success()
         working-directory: imgui-java
         shell: bash
         run: |
-          set -eux
+          LIB="${{ steps.findlib.outputs.LIB }}"
 
-          LIB="$(cat /tmp/imgui_library_path.txt)"
+          MACHINE=$(readelf -h "$LIB" \
+            | awk -F: '/Machine:/ {print $2}' \
+            | xargs)
 
-          MACHINE="$(readelf -h "$LIB" | \
-            awk -F: '/Machine:/ {print $2}' | \
-            xargs)"
+          echo "Machine: $MACHINE"
 
-          echo "Detected machine:"
-          echo "$MACHINE"
-
-          if [[ "$MACHINE" != *"AArch64"* ]]; then
-            echo "::error::The generated library is NOT AArch64."
-            echo "::error::Detected: $MACHINE"
+          if [[ "$MACHINE" != "AArch64" ]]; then
+            echo "::error::Wrong architecture!"
+            echo "::error::Expected AArch64"
+            echo "::error::Got $MACHINE"
             exit 1
           fi
 
-          echo "SUCCESS: ARM64/AArch64 library confirmed."
+          echo "======================================"
+          echo "SUCCESS"
+          echo "======================================"
+          echo "ARM64/AArch64 native library confirmed."
 
 
-      # ------------------------------------------------------------
-      # 10. Prepare artifact
-      # ------------------------------------------------------------
+      # ============================================================
+      # 13. Prepare artifact
+      # ============================================================
+
       - name: Prepare artifact
+        if: success()
         working-directory: imgui-java
-        shell: bash
         run: |
-          set -eux
-
-          LIB="$(cat /tmp/imgui_library_path.txt)"
-
           mkdir -p ../artifact
+
+          LIB="${{ steps.findlib.outputs.LIB }}"
 
           cp "$LIB" \
             ../artifact/libimgui-java64.so
 
-          # Дополнительная информация для проверки.
           git rev-parse HEAD \
             > ../artifact/SOURCE_COMMIT.txt
-
-          readelf -h "$LIB" \
-            > ../artifact/ELF_HEADER.txt
 
           file "$LIB" \
             > ../artifact/FILE_INFO.txt
 
-          ls -lh ../artifact/
+          readelf -h "$LIB" \
+            > ../artifact/ELF_HEADER.txt
+
+          echo "======================================"
+          echo "ARTIFACT"
+          echo "======================================"
+
+          ls -lh ../artifact
 
 
-      # ------------------------------------------------------------
-      # 11. Upload artifact
-      # ------------------------------------------------------------
-      - name: Upload ARM64 library
+      # ============================================================
+      # 14. Upload
+      # ============================================================
+
+      - name: Upload ARM64 artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: imgui-java-linux-arm64
