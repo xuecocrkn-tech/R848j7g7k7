@@ -1,0 +1,102 @@
+name: Build imgui-java Linux ARM64
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout Moulberry imgui-java
+        uses: actions/checkout@v4
+        with:
+          repository: Moulberry/imgui-java
+          ref: aacdae671a
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            openjdk-17-jdk \
+            ant \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            make
+
+      - name: Check compiler
+        run: |
+          java -version
+          aarch64-linux-gnu-g++ --version
+
+      - name: Show commit
+        run: |
+          git rev-parse HEAD
+          git submodule status
+
+      - name: Configure ARM64 cross compilation
+        run: |
+          cat > arm64.properties <<'EOF'
+          CC=aarch64-linux-gnu-gcc
+          CXX=aarch64-linux-gnu-g++
+          AR=aarch64-linux-gnu-ar
+          RANLIB=aarch64-linux-gnu-ranlib
+          STRIP=aarch64-linux-gnu-strip
+          EOF
+
+      - name: Build native library
+        run: |
+          chmod +x gradlew
+
+          ./gradlew \
+            :imgui-binding:generateLibs \
+            -Denvs=linux \
+            -Dlocal \
+            -Pcc=aarch64-linux-gnu-gcc \
+            -Pcxx=aarch64-linux-gnu-g++
+
+      - name: Find generated library
+        run: |
+          echo "Searching for native libraries..."
+          find . -type f \( \
+            -name 'libimgui-java64.so' -o \
+            -name '*.so' \
+          \) -print
+
+      - name: Verify ARM64 architecture
+        run: |
+          LIB="$(find . -type f -name 'libimgui-java64.so' | head -n 1)"
+
+          if [ -z "$LIB" ]; then
+            echo "ERROR: libimgui-java64.so was not produced."
+            exit 1
+          fi
+
+          echo "Library:"
+          echo "$LIB"
+
+          file "$LIB"
+          readelf -h "$LIB" | grep -E 'Class:|Machine:'
+
+          if ! file "$LIB" | grep -qi 'ARM aarch64'; then
+            echo "ERROR: library is NOT AArch64!"
+            exit 1
+          fi
+
+      - name: Prepare artifact
+        run: |
+          mkdir -p artifact
+          LIB="$(find . -type f -name 'libimgui-java64.so' | head -n 1)"
+          cp "$LIB" artifact/libimgui-java64.so
+
+          file artifact/libimgui-java64.so
+
+      - name: Upload ARM64 library
+        uses: actions/upload-artifact@v4
+        with:
+          name: imgui-java-linux-arm64
+          path: artifact/libimgui-java64.so
+          if-no-files-found: error
