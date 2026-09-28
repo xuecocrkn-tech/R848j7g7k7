@@ -52,14 +52,34 @@ jobs:
             exit 1
           fi
 
+          echo "Using commit: $SHA"
+
           git checkout "$SHA"
 
           git submodule update --init --recursive
 
+          echo
           echo "===== COMMIT ====="
           git rev-parse HEAD
 
-      - name: Patch Linux compiler prefix
+      - name: Inspect Gradle tasks
+        working-directory: imgui-java
+        shell: bash
+        run: |
+          set -e
+
+          ./gradlew tasks --all --no-daemon \
+            | tee ../tasks.log
+
+          echo
+          echo "===== JNI / NATIVE TASKS ====="
+
+          grep -Ei \
+            "jnigen|native|generateLibs|compile.*linux|build.*linux" \
+            ../tasks.log \
+            || true
+
+      - name: Patch Linux compiler
         working-directory: imgui-java
         shell: bash
         run: |
@@ -71,100 +91,106 @@ jobs:
           from pathlib import Path
 
           p = Path("buildSrc/src/main/groovy/tool/generator/GenerateLibs.groovy")
+
+          if not p.exists():
+              raise SystemExit("GenerateLibs.groovy not found")
+
           s = p.read_text()
 
           old = "def linux64 = BuildTarget.newDefaultTarget(Os.Linux, Architecture.Bitness._64)"
 
+          new = old + "\n            linux64.compilerPrefix = 'aarch64-linux-gnu-'"
+
           if "linux64.compilerPrefix" not in s:
               if old not in s:
-                  raise SystemExit("Linux target not found")
+                  raise SystemExit("Linux target declaration not found")
 
-              s = s.replace(
-                  old,
-                  old + "\n            linux64.compilerPrefix = 'aarch64-linux-gnu-'",
-                  1
-              )
-
+              s = s.replace(old, new, 1)
               p.write_text(s)
 
-          print("===== PATCHED SOURCE =====")
+          print("===== LINUX TARGET =====")
 
-          for i, line in enumerate(p.read_text().splitlines(), 1):
+          for n, line in enumerate(p.read_text().splitlines(), 1):
               if "linux64" in line:
-                  print(f"{i}: {line}")
+                  print(f"{n}: {line}")
           PY
 
-      - name: Generate native build files
+      - name: Generate JNI build files only
         working-directory: imgui-java
         shell: bash
         run: |
           set -e
 
-          echo "===== GENERATING JNIGEN FILES ====="
+          echo "===== GENERATING ====="
 
           ./gradlew \
-            :imgui-binding:generateLibs \
-            -Denvs=linux \
-            -Dlocal \
+            :imgui-binding:jnigen \
             --no-daemon \
             --stacktrace \
-            --info
+            --info \
+            2>&1 | tee ../generation.log
 
-          echo
-          echo "===== SEARCHING GENERATED BUILD FILES ====="
-
-          find . \
-            -type f \
-            \( -name "build-linux64.xml" -o -name "build-linux.xml" \) \
-            -print
-
-      - name: Inspect generated Ant files
+      - name: Inspect generated native files
         working-directory: imgui-java
         shell: bash
         run: |
           set +e
 
-          echo "===== ALL XML FILES ====="
+          echo "======================================"
+          echo "GENERATED NATIVE FILES"
+          echo "======================================"
+
+          echo
+          echo "===== BUILD XML ====="
 
           find . \
             -type f \
-            -name "*.xml" \
+            \( \
+              -name "*.xml" \
+              -o -name "build.xml" \
+            \) \
             -print
 
           echo
-          echo "===== COMPILER REFERENCES ====="
+          echo "===== COMPILERS IN XML ====="
 
           grep -RniE \
-            "g\+\+|gcc|compiler|cppCompiler|cCompiler" \
+            "g\+\+|gcc|aarch64|compilerPrefix" \
             . \
             --include="*.xml" \
-            | head -n 200
+            | head -n 300
 
-      - name: Force ARM64 in generated build files
+          echo
+          echo "===== JNI DIRECTORIES ====="
+
+          find . \
+            -type d \
+            \( \
+              -name "jni" \
+              -o -name "native" \
+              -o -name "build" \
+            \) \
+            -print \
+            | head -n 100
+
+      - name: Force ARM64 compiler in generated files
         working-directory: imgui-java
         shell: bash
         run: |
           set -e
 
-          echo "===== BEFORE PATCH ====="
-
-          grep -RniE \
-            "g\+\+|gcc" \
-            . \
-            --include="*.xml" \
-            | head -n 100 || true
-
           python3 - <<'PY'
           from pathlib import Path
 
-          replacements = {
-              "g++": "aarch64-linux-gnu-g++",
-              "gcc": "aarch64-linux-gnu-gcc",
-          }
+          files = []
 
-          count = 0
+          for p in Path(".").rglob("*"):
+              if not p.is_file():
+                  continue
 
-          for p in Path(".").rglob("*.xml"):
+              if p.suffix not in [".xml", ".properties", ".groovy", ".java"]:
+                  continue
+
               try:
                   s = p.read_text()
               except Exception:
@@ -172,51 +198,79 @@ jobs:
 
               old = s
 
-              for a, b in replacements.items():
-                  s = s.replace(a, b)
+              s = s.replace(
+                  "g++",
+                  "aarch64-linux-gnu-g++"
+              )
+
+              s = s.replace(
+                  "gcc",
+                  "aarch64-linux-gnu-gcc"
+              )
 
               if s != old:
                   p.write_text(s)
-                  count += 1
-                  print("PATCHED:", p)
+                  files.append(str(p))
+
+          print("Patched files:")
+
+          for f in files:
+              print(f)
 
           print()
-          print("XML FILES PATCHED:", count)
+          print("Total:", len(files))
           PY
 
           echo
-          echo "===== AFTER PATCH ====="
+          echo "===== ARM64 REFERENCES ====="
 
           grep -RniE \
             "aarch64-linux-gnu-g\+\+|aarch64-linux-gnu-gcc" \
             . \
             --include="*.xml" \
-            | head -n 200 || true
+            --include="*.properties" \
+            | head -n 300 \
+            || true
 
-      - name: Build native library
+      - name: Find native build task
+        working-directory: imgui-java
+        shell: bash
+        run: |
+          set -e
+
+          echo "===== TASKS ====="
+
+          ./gradlew tasks --all --no-daemon \
+            | grep -Ei \
+              "jnigenBuild|native.*linux|linux.*native|build.*linux" \
+            || true
+
+      - name: Build Linux native target
         working-directory: imgui-java
         shell: bash
         run: |
           set -o pipefail
 
-          echo "===== ARM64 COMPILER ====="
+          echo "======================================"
+          echo "ARM64 TOOLCHAIN"
+          echo "======================================"
 
-          aarch64-linux-gnu-g++ -dumpmachine
           aarch64-linux-gnu-gcc -dumpmachine
+          aarch64-linux-gnu-g++ -dumpmachine
 
           echo
-          echo "===== BUILD ====="
+          echo "======================================"
+          echo "BUILDING NATIVE TARGET"
+          echo "======================================"
 
           ./gradlew \
-            :imgui-binding:generateLibs \
-            -Denvs=linux \
-            -Dlocal \
+            :imgui-binding:jnigenBuildLinux64 \
             --no-daemon \
             --stacktrace \
             --info \
-            2>&1 | tee ../gradle-build.log
+            2>&1 | tee ../native-build.log
 
-      - name: Show generated libraries
+      - name: Show SO files
         if: always()
         working-directory: imgui-java
         shell: bash
@@ -229,11 +283,9 @@ jobs:
             -print
 
           echo
-          echo "===== FILE TYPES ====="
+          echo "===== FILE ====="
 
           while IFS= read -r -d '' f; do
-            echo
-            echo "FILE: $f"
             file "$f"
           done < <(
             find . \
@@ -258,27 +310,29 @@ jobs:
             exit 1
           fi
 
-          echo "===== LIBRARY ====="
+          echo "LIBRARY:"
           echo "$LIB"
 
           echo
-          echo "===== FILE ====="
           file "$LIB"
 
           echo
-          echo "===== ELF ====="
           readelf -h "$LIB" | grep "Machine:"
 
           if readelf -h "$LIB" | grep -q "Machine:.*AArch64"; then
+
             echo
             echo "======================================"
-            echo " ARM64 BUILD SUCCESSFUL"
+            echo "       ARM64 SUCCESS"
             echo "======================================"
+
           else
+
             echo
             echo "======================================"
-            echo " WRONG ARCHITECTURE"
+            echo "       WRONG ARCHITECTURE"
             echo "======================================"
+
             exit 1
           fi
 
@@ -299,6 +353,7 @@ jobs:
           cp "$LIB" ../artifact/libimgui-java64.so
 
           file ../artifact/libimgui-java64.so
+
           ls -lh ../artifact/libimgui-java64.so
 
       - name: Upload ARM64 library
@@ -309,7 +364,7 @@ jobs:
           path: artifact/libimgui-java64.so
           if-no-files-found: error
 
-      - name: Diagnostics
+      - name: Failure diagnostics
         if: failure()
         working-directory: imgui-java
         shell: bash
@@ -317,31 +372,40 @@ jobs:
           set +e
 
           echo "======================================"
-          echo "BUILD DIAGNOSTICS"
+          echo "FAILURE DIAGNOSTICS"
           echo "======================================"
 
           echo
-          echo "===== GENERATED XML COMPILERS ====="
+          echo "===== NATIVE TASKS ====="
+
+          ./gradlew tasks --all --no-daemon \
+            | grep -Ei \
+              "jnigen|native|linux" \
+            | head -n 200
+
+          echo
+          echo "===== GENERATED COMPILER COMMANDS ====="
 
           grep -RniE \
-            "aarch64-linux-gnu|g\+\+|gcc" \
+            "aarch64-linux-gnu|g\+\+|gcc|clang" \
             . \
             --include="*.xml" \
+            --include="*.properties" \
             | tail -n 200
 
           echo
-          echo "===== IMPORTANT ERRORS ====="
+          echo "===== ERRORS ====="
 
-          if [ -f ../gradle-build.log ]; then
+          if [ -f ../native-build.log ]; then
             grep -nEi \
               "FAILURE:|Execution failed|Caused by:|error:|fatal error|undefined reference|cannot find|not found" \
-              ../gradle-build.log \
-              | head -n 150
+              ../native-build.log \
+              | head -n 200
           fi
 
           echo
           echo "===== LAST LOG ====="
 
-          if [ -f ../gradle-build.log ]; then
-            tail -n 150 ../gradle-build.log
+          if [ -f ../native-build.log ]; then
+            tail -n 200 ../native-build.log
           fi
