@@ -52,98 +52,14 @@ jobs:
             exit 1
           fi
 
-          echo "Using commit: $SHA"
-
           git checkout "$SHA"
+
           git submodule update --init --recursive
 
           echo "===== COMMIT ====="
           git rev-parse HEAD
 
-      - name: Create ARM64 compiler wrappers
-        shell: bash
-        run: |
-          set -e
-
-          mkdir -p "$HOME/arm64-tools"
-
-          cat > "$HOME/arm64-tools/gcc" <<'EOF'
-          #!/bin/sh
-          exec aarch64-linux-gnu-gcc "$@"
-          EOF
-
-          cat > "$HOME/arm64-tools/g++" <<'EOF'
-          #!/bin/sh
-          exec aarch64-linux-gnu-g++ "$@"
-          EOF
-
-          cat > "$HOME/arm64-tools/cc" <<'EOF'
-          #!/bin/sh
-          exec aarch64-linux-gnu-gcc "$@"
-          EOF
-
-          cat > "$HOME/arm64-tools/c++" <<'EOF'
-          #!/bin/sh
-          exec aarch64-linux-gnu-g++ "$@"
-          EOF
-
-          cat > "$HOME/arm64-tools/ar" <<'EOF'
-          #!/bin/sh
-          exec aarch64-linux-gnu-ar "$@"
-          EOF
-
-          cat > "$HOME/arm64-tools/ld" <<'EOF'
-          #!/bin/sh
-          exec aarch64-linux-gnu-ld "$@"
-          EOF
-
-          cat > "$HOME/arm64-tools/strip" <<'EOF'
-          #!/bin/sh
-          exec aarch64-linux-gnu-strip "$@"
-          EOF
-
-          cat > "$HOME/arm64-tools/ranlib" <<'EOF'
-          #!/bin/sh
-          exec aarch64-linux-gnu-ranlib "$@"
-          EOF
-
-          cat > "$HOME/arm64-tools/nm" <<'EOF'
-          #!/bin/sh
-          exec aarch64-linux-gnu-nm "$@"
-          EOF
-
-          chmod +x "$HOME/arm64-tools/"*
-
-          echo "$HOME/arm64-tools" >> "$GITHUB_PATH"
-
-      - name: Verify compiler interception
-        shell: bash
-        run: |
-          set -e
-
-          echo "===== PATH ====="
-          which gcc
-          which g++
-          which cc
-          which c++
-
-          echo
-          echo "===== GCC TARGET ====="
-          gcc -dumpmachine
-
-          echo
-          echo "===== G++ TARGET ====="
-          g++ -dumpmachine
-
-          test "$(gcc -dumpmachine)" = "aarch64-linux-gnu"
-          test "$(g++ -dumpmachine)" = "aarch64-linux-gnu"
-
-          echo
-          echo "======================================"
-          echo " ARM64 COMPILER ACTIVE"
-          echo "======================================"
-
-      - name: Patch build configuration
+      - name: Patch Linux compiler prefix
         working-directory: imgui-java
         shell: bash
         run: |
@@ -159,43 +75,134 @@ jobs:
 
           old = "def linux64 = BuildTarget.newDefaultTarget(Os.Linux, Architecture.Bitness._64)"
 
-          if "linux64.compilerPrefix" in s:
-              print("compilerPrefix already present")
-          elif old in s:
+          if "linux64.compilerPrefix" not in s:
+              if old not in s:
+                  raise SystemExit("Linux target not found")
+
               s = s.replace(
                   old,
                   old + "\n            linux64.compilerPrefix = 'aarch64-linux-gnu-'",
                   1
               )
+
               p.write_text(s)
-              print("compilerPrefix added")
-          else:
-              print("Linux target not found")
-              raise SystemExit(1)
+
+          print("===== PATCHED SOURCE =====")
+
+          for i, line in enumerate(p.read_text().splitlines(), 1):
+              if "linux64" in line:
+                  print(f"{i}: {line}")
+          PY
+
+      - name: Generate native build files
+        working-directory: imgui-java
+        shell: bash
+        run: |
+          set -e
+
+          echo "===== GENERATING JNIGEN FILES ====="
+
+          ./gradlew \
+            :imgui-binding:generateLibs \
+            -Denvs=linux \
+            -Dlocal \
+            --no-daemon \
+            --stacktrace \
+            --info
+
+          echo
+          echo "===== SEARCHING GENERATED BUILD FILES ====="
+
+          find . \
+            -type f \
+            \( -name "build-linux64.xml" -o -name "build-linux.xml" \) \
+            -print
+
+      - name: Inspect generated Ant files
+        working-directory: imgui-java
+        shell: bash
+        run: |
+          set +e
+
+          echo "===== ALL XML FILES ====="
+
+          find . \
+            -type f \
+            -name "*.xml" \
+            -print
+
+          echo
+          echo "===== COMPILER REFERENCES ====="
+
+          grep -RniE \
+            "g\+\+|gcc|compiler|cppCompiler|cCompiler" \
+            . \
+            --include="*.xml" \
+            | head -n 200
+
+      - name: Force ARM64 in generated build files
+        working-directory: imgui-java
+        shell: bash
+        run: |
+          set -e
+
+          echo "===== BEFORE PATCH ====="
+
+          grep -RniE \
+            "g\+\+|gcc" \
+            . \
+            --include="*.xml" \
+            | head -n 100 || true
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          replacements = {
+              "g++": "aarch64-linux-gnu-g++",
+              "gcc": "aarch64-linux-gnu-gcc",
+          }
+
+          count = 0
+
+          for p in Path(".").rglob("*.xml"):
+              try:
+                  s = p.read_text()
+              except Exception:
+                  continue
+
+              old = s
+
+              for a, b in replacements.items():
+                  s = s.replace(a, b)
+
+              if s != old:
+                  p.write_text(s)
+                  count += 1
+                  print("PATCHED:", p)
+
+          print()
+          print("XML FILES PATCHED:", count)
           PY
 
           echo
-          grep -n -A5 -B2 \
-            "BuildTarget.newDefaultTarget(Os.Linux" \
-            "$FILE"
+          echo "===== AFTER PATCH ====="
 
-      - name: Build JNI ARM64
+          grep -RniE \
+            "aarch64-linux-gnu-g\+\+|aarch64-linux-gnu-gcc" \
+            . \
+            --include="*.xml" \
+            | head -n 200 || true
+
+      - name: Build native library
         working-directory: imgui-java
         shell: bash
         run: |
           set -o pipefail
 
-          echo "===== ENVIRONMENT ====="
-          echo "CC=$CC"
-          echo "CXX=$CXX"
-          echo "PATH=$PATH"
+          echo "===== ARM64 COMPILER ====="
 
-          echo
-          echo "===== COMPILERS ====="
-          which gcc
-          which g++
-          gcc -dumpmachine
-          g++ -dumpmachine
+          aarch64-linux-gnu-g++ -dumpmachine
+          aarch64-linux-gnu-gcc -dumpmachine
 
           echo
           echo "===== BUILD ====="
@@ -208,53 +215,6 @@ jobs:
             --stacktrace \
             --info \
             2>&1 | tee ../gradle-build.log
-
-      - name: Diagnose failure
-        if: failure()
-        shell: bash
-        run: |
-          set +e
-
-          LOG="gradle-build.log"
-
-          echo
-          echo "=================================================="
-          echo "BUILD FAILURE DIAGNOSTICS"
-          echo "=================================================="
-
-          if [ ! -f "$LOG" ]; then
-            echo "gradle-build.log not found"
-            exit 0
-          fi
-
-          echo
-          echo "===== IMPORTANT ERRORS ====="
-
-          grep -nEi \
-            "Execution failed for task|FAILURE:|Caused by:|error:|fatal error:|undefined reference|cannot find|not found|No such file|Permission denied|Exception" \
-            "$LOG" \
-            | head -n 120
-
-          echo
-          echo "===== COMPILER COMMANDS ====="
-
-          grep -nEi \
-            "aarch64-linux-gnu|g\+\+|gcc|clang" \
-            "$LOG" \
-            | tail -n 150
-
-          echo
-          echo "===== FAILED TASKS ====="
-
-          grep -nEi \
-            "Execution failed for task" \
-            "$LOG" \
-            | tail -n 20
-
-          echo
-          echo "===== LAST 150 LINES ====="
-
-          tail -n 150 "$LOG"
 
       - name: Show generated libraries
         if: always()
@@ -294,7 +254,7 @@ jobs:
             -print -quit)
 
           if [ -z "$LIB" ]; then
-            echo "ERROR: libimgui-java64.so was not created"
+            echo "ERROR: libimgui-java64.so not found"
             exit 1
           fi
 
@@ -306,23 +266,19 @@ jobs:
           file "$LIB"
 
           echo
-          echo "===== ELF MACHINE ====="
+          echo "===== ELF ====="
           readelf -h "$LIB" | grep "Machine:"
 
           if readelf -h "$LIB" | grep -q "Machine:.*AArch64"; then
-
             echo
             echo "======================================"
             echo " ARM64 BUILD SUCCESSFUL"
             echo "======================================"
-
           else
-
             echo
             echo "======================================"
             echo " WRONG ARCHITECTURE"
             echo "======================================"
-
             exit 1
           fi
 
@@ -343,7 +299,6 @@ jobs:
           cp "$LIB" ../artifact/libimgui-java64.so
 
           file ../artifact/libimgui-java64.so
-
           ls -lh ../artifact/libimgui-java64.so
 
       - name: Upload ARM64 library
@@ -353,3 +308,40 @@ jobs:
           name: imgui-java-linux-arm64
           path: artifact/libimgui-java64.so
           if-no-files-found: error
+
+      - name: Diagnostics
+        if: failure()
+        working-directory: imgui-java
+        shell: bash
+        run: |
+          set +e
+
+          echo "======================================"
+          echo "BUILD DIAGNOSTICS"
+          echo "======================================"
+
+          echo
+          echo "===== GENERATED XML COMPILERS ====="
+
+          grep -RniE \
+            "aarch64-linux-gnu|g\+\+|gcc" \
+            . \
+            --include="*.xml" \
+            | tail -n 200
+
+          echo
+          echo "===== IMPORTANT ERRORS ====="
+
+          if [ -f ../gradle-build.log ]; then
+            grep -nEi \
+              "FAILURE:|Execution failed|Caused by:|error:|fatal error|undefined reference|cannot find|not found" \
+              ../gradle-build.log \
+              | head -n 150
+          fi
+
+          echo
+          echo "===== LAST LOG ====="
+
+          if [ -f ../gradle-build.log ]; then
+            tail -n 150 ../gradle-build.log
+          fi
