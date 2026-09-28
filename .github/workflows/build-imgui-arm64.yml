@@ -29,49 +29,35 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Clone exact imgui-java commit
-        shell: bash
+      - name: Clone imgui-java
         run: |
           git clone https://github.com/Moulberry/imgui-java.git imgui-java
+
           cd imgui-java
 
           git fetch --all --tags --prune
 
-          SHA="$(git rev-list --all | grep '^aacdae671a' | head -n 1)"
+          SHA=$(git rev-list --all | grep '^aacdae671a' | head -n 1)
 
           if [ -z "$SHA" ]; then
-            echo "ERROR: commit aacdae671a not found"
+            echo "ERROR: commit aacdae671a was not found"
             exit 1
           fi
 
-          echo "Found commit: $SHA"
+          echo "Using commit:"
+          echo "$SHA"
 
           git checkout "$SHA"
           git submodule update --init --recursive
 
-          echo "HEAD:"
+          echo "Current commit:"
           git rev-parse HEAD
 
-      - name: Show native build files
+      - name: Find native compiler commands
         working-directory: imgui-java
-        shell: bash
         run: |
-          echo "Searching for compiler commands..."
+          echo "Searching build files..."
 
-          grep -RniE \
-            'g\+\+|gcc|clang\+\+|clang|linux64|libimgui-java64' \
-            buildSrc imgui-binding \
-            --exclude-dir=.gradle \
-            --exclude='*.class' \
-            || true
-
-      - name: Patch compiler for ARM64
-        working-directory: imgui-java
-        shell: bash
-        run: |
-          set -e
-
-          echo "Before patch:"
           grep -RniE \
             'g\+\+|gcc|clang\+\+|clang' \
             buildSrc imgui-binding \
@@ -79,33 +65,48 @@ jobs:
             --exclude='*.class' \
             || true
 
-          echo
-          echo "Replacing native compiler commands..."
+      - name: Patch native compiler
+        working-directory: imgui-java
+        shell: bash
+        run: |
+          set -e
 
-          # Replace common hardcoded compiler names.
-          find buildSrc imgui-binding -type f \
-            -name "*.xml" -o -name "*.gradle" -o -name "*.groovy" \
-               -o -name "*.sh" -o -name "*.java" \
-            -print0 |
+          echo "Patching compiler commands..."
+
           while IFS= read -r -d '' file; do
+            echo "Patching: $file"
 
             sed -i \
               -e 's/\bg++\b/aarch64-linux-gnu-g++/g' \
               -e 's/\bgcc\b/aarch64-linux-gnu-gcc/g' \
               "$file"
 
-          done
+          done < <(
+            find buildSrc imgui-binding \
+              -type f \
+              \( \
+                -name "*.xml" -o \
+                -name "*.gradle" -o \
+                -name "*.groovy" -o \
+                -name "*.kts" -o \
+                -name "*.sh" -o \
+                -name "*.java" -o \
+                -name "*.kt" \
+              \) \
+              -print0
+          )
 
           echo
-          echo "After patch:"
+          echo "Checking patched compiler names..."
+
           grep -RniE \
             'aarch64-linux-gnu-g\+\+|aarch64-linux-gnu-gcc' \
             buildSrc imgui-binding \
             --exclude-dir=.gradle \
+            --exclude='*.class' \
             || true
 
-      - name: Configure ARM64 compiler
-        working-directory: imgui-java
+      - name: Configure ARM64 toolchain
         run: |
           echo "CC=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
           echo "CXX=aarch64-linux-gnu-g++" >> "$GITHUB_ENV"
@@ -115,9 +116,12 @@ jobs:
           echo "RANLIB=aarch64-linux-gnu-ranlib" >> "$GITHUB_ENV"
           echo "STRIP=aarch64-linux-gnu-strip" >> "$GITHUB_ENV"
 
-          echo "Compiler versions:"
-          aarch64-linux-gnu-g++ --version
+          echo "===== GCC ====="
           aarch64-linux-gnu-gcc --version
+
+          echo
+          echo "===== G++ ====="
+          aarch64-linux-gnu-g++ --version
 
       - name: Build JNI ARM64
         working-directory: imgui-java
@@ -134,18 +138,29 @@ jobs:
             --info \
             2>&1 | tee ../gradle-build.log
 
-      - name: Find generated libraries
+      - name: Find generated SO files
         if: always()
         working-directory: imgui-java
+        shell: bash
         run: |
-          echo "===== ALL SO FILES ====="
+          echo "===== SO FILES ====="
 
-          find . -type f -name "*.so" -print
+          find . \
+            -type f \
+            -name "*.so" \
+            -print
 
           echo
-          echo "===== FILE INFORMATION ====="
+          echo "===== FILE INFO ====="
 
-          find . -type f -name "*.so" -exec file {} \;
+          while IFS= read -r -d '' file; do
+            file "$file"
+          done < <(
+            find . \
+              -type f \
+              -name "*.so" \
+              -print0
+          )
 
       - name: Verify ARM64
         working-directory: imgui-java
@@ -153,25 +168,81 @@ jobs:
         run: |
           set -e
 
-          LIB="$(find . -type f -name 'libimgui-java64.so' | head -n 1)"
+          LIB=$(find . \
+            -type f \
+            -name 'libimgui-java64.so' \
+            -print -quit)
 
           if [ -z "$LIB" ]; then
-            echo "ERROR: libimgui-java64.so was not produced!"
+            echo "ERROR: libimgui-java64.so was not found"
+            echo
+            echo "Available SO files:"
+
+            find . \
+              -type f \
+              -name "*.so" \
+              -print
+
             exit 1
           fi
 
-          echo "Found:"
+          echo "Found library:"
           echo "$LIB"
 
           echo
-          echo "===== ELF HEADER ====="
+          echo "===== ELF ====="
 
           readelf -h "$LIB"
 
-          MACHINE="$(readelf -h "$LIB" | grep 'Machine:' | sed 's/.*Machine:[[:space:]]*//')"
+          MACHINE=$(readelf -h "$LIB" | grep 'Machine:')
 
           echo
-          echo "Detected architecture:"
+          echo "Machine:"
           echo "$MACHINE"
 
-          if [[ "$MACHINE"
+          if echo "$MACHINE" | grep -q "AArch64"; then
+            echo
+            echo "================================"
+            echo "SUCCESS: ARM64 LIBRARY"
+            echo "================================"
+          else
+            echo
+            echo "================================"
+            echo "WRONG ARCHITECTURE"
+            echo "================================"
+            exit 1
+          fi
+
+          echo
+          file "$LIB"
+
+      - name: Prepare artifact
+        working-directory: imgui-java
+        run: |
+          mkdir -p ../artifact
+
+          LIB=$(find . \
+            -type f \
+            -name 'libimgui-java64.so' \
+            -print -quit)
+
+          cp "$LIB" ../artifact/libimgui-java64.so
+
+          ls -lh ../artifact/libimgui-java64.so
+
+      - name: Upload ARM64 library
+        uses: actions/upload-artifact@v4
+        with:
+          name: imgui-java-linux-arm64
+          path: artifact/libimgui-java64.so
+          if-no-files-found: error
+
+      - name: Print Gradle log
+        if: failure()
+        shell: bash
+        run: |
+          echo "===== LAST 150 LINES OF GRADLE LOG ====="
+
+          if [ -f imgui-java/../gradle-build.log ]; then
+            tail -n 150 gradle-build.log
+          fi
